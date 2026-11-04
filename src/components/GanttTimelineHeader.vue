@@ -9,7 +9,7 @@ const emit = defineEmits<{
   (e: 'action', payload: { command: string; day: TimelineDay }): void
 }>()
 
-const { state, timelineWidth, dayList, hourLabelStep } = useGantt()
+const { state, timelineWidth, visibleDays, dayLeadPx, hourLabelStep } = useGantt()
 
 const dayWidth = computed(() => 24 * state.hourWidth)
 
@@ -21,8 +21,9 @@ function onCommand(command: string, day: TimelineDay) {
 <template>
   <div class="tl-header" :style="{ width: `${timelineWidth}px` }">
     <div class="tl-days">
+      <div v-if="dayLeadPx" class="tl-gap" :style="{ width: `${dayLeadPx}px` }" />
       <div
-        v-for="day in dayList"
+        v-for="day in visibleDays"
         :key="day.start"
         class="tl-day"
         :class="{ 'is-weekend': day.weekend, 'is-today': day.isToday }"
@@ -53,8 +54,9 @@ function onCommand(command: string, day: TimelineDay) {
     </div>
 
     <div class="tl-hours">
+      <div v-if="dayLeadPx" class="tl-gap" :style="{ width: `${dayLeadPx}px` }" />
       <div
-        v-for="day in dayList"
+        v-for="day in visibleDays"
         :key="day.start"
         class="tl-hour-group"
         :class="{ 'is-weekend': day.weekend }"
@@ -89,6 +91,11 @@ function onCommand(command: string, day: TimelineDay) {
 .tl-days {
   display: flex;
   height: 30px;
+}
+
+/* 被裁掉的日期用空白占位，保持刻度位置不变 */
+.tl-gap {
+  flex: none;
 }
 
 .tl-day {

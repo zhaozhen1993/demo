@@ -36,6 +36,14 @@ const {
   setRange,
   fitToView,
   scrollToNow,
+  visibleDay,
+  visibleDays,
+  visibleRows,
+  visibleTasksByRow,
+  dayLeadPx,
+  rowLeadPx,
+  syncScroll,
+  measureViewport,
 } = g
 
 const stageRef = ref<HTMLElement | null>(null)
@@ -45,21 +53,15 @@ const dialogMode = ref<'create' | 'edit'>('create')
 const dialogTask = ref<GanttTask | null>(null)
 const dialogStart = ref<number>(Date.now())
 
-/** 横向滚动位置，用于计算视图左缘落在哪一天 */
-const scrollLeft = ref(0)
-const visibleDay = computed(() => {
-  const dayWidth = 24 * state.hourWidth
-  const index = Math.floor(scrollLeft.value / dayWidth)
-  return dayList.value[Math.min(Math.max(index, 0), dayList.value.length - 1)]
-})
-
 const draggingRowId = computed(
   () => state.tasks.find((t) => t.id === state.draggingId)?.rowId ?? null,
 )
 
-function onScroll() {
-  scrollLeft.value = stageRef.value?.scrollLeft ?? 0
-}
+/** 行区上/下占位高度，用透明 spacer 撑住被裁掉的行 */
+const rowGapTop = computed(() => rowLeadPx.value)
+const rowGapBottom = computed(() =>
+  Math.max(0, (filteredRows.value.length - visibleRows.value.length) * state.rowHeight - rowGapTop.value),
+)
 
 /* ------------------------------ 样式变量 ------------------------------ */
 
@@ -78,12 +80,12 @@ const timelineStyle = computed(() => ({
 
 /* ------------------------------ 网格装饰 ------------------------------ */
 
-/** 非工作时段（00:00-08:00 / 18:00-24:00） */
+/** 非工作时段（00:00-08:00 / 18:00-24:00），只画可视日期 */
 const nightBands = computed(() => {
   if (!state.showNight) return []
   const hw = state.hourWidth
   const bands: { left: number; width: number }[] = []
-  dayList.value.forEach((day) => {
+  visibleDays.value.forEach((day) => {
     const base = day.index * 24 * hw
     bands.push({ left: base, width: 8 * hw })
     bands.push({ left: base + 18 * hw, width: 6 * hw })
@@ -94,13 +96,13 @@ const nightBands = computed(() => {
 const weekendBands = computed(() => {
   if (!state.showWeekend) return []
   const hw = state.hourWidth
-  return dayList.value
+  return visibleDays.value
     .filter((d) => d.weekend)
     .map((d) => ({ left: d.index * 24 * hw, width: 24 * hw }))
 })
 
 const dayDividers = computed(() =>
-  dayList.value.map((d) => ({ left: d.index * 24 * state.hourWidth, today: d.isToday })),
+  visibleDays.value.map((d) => ({ left: d.index * 24 * state.hourWidth, today: d.isToday })),
 )
 
 /** 当前时间竖线位置（相对时间轴） */
@@ -272,25 +274,39 @@ function onKeydown(event: KeyboardEvent) {
 /* ------------------------------ 生命周期 ------------------------------ */
 
 let timer: number | undefined
+let resizeObserver: ResizeObserver | undefined
 
 onMounted(() => {
   scrollEl.value = stageRef.value
   stageRef.value?.focus({ preventScroll: true })
   window.addEventListener('click', closeMenu)
   timer = window.setInterval(() => g.tick(), 30_000)
+
+  // 首帧先量一次真实视口，之后窗口/布局变化时重算
+  measureViewport()
+  if (stageRef.value && typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(() => measureViewport())
+    resizeObserver.observe(stageRef.value)
+  }
+
   requestAnimationFrame(() => scrollToNow(0.3))
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('click', closeMenu)
   if (timer) window.clearInterval(timer)
+  resizeObserver?.disconnect()
 })
 
 // 视图范围变化后确保选中块仍在可视范围
 watch(
   () => [state.rangeStart, state.days, state.hourWidth],
   () => {
-    if (selectedTask.value) g.revealTask(selectedTask.value.id)
+    // 天数/刻度变化会改变内容宽度，浏览器可能夹紧 scrollLeft，需重新同步窗口
+    requestAnimationFrame(() => {
+      measureViewport()
+      if (selectedTask.value) g.revealTask(selectedTask.value.id)
+    })
   },
 )
 
@@ -313,7 +329,7 @@ function jumpToTask(task: GanttTask) {
       class="gantt-stage"
       tabindex="0"
       @keydown="onKeydown"
-      @scroll.passive="onScroll"
+      @scroll.passive="syncScroll"
       @click="onStageClick"
     >
       <div class="gantt-canvas" :style="canvasStyle">
@@ -359,10 +375,14 @@ function jumpToTask(task: GanttTask) {
             </div>
           </div>
 
-          <!-- 行 -->
+          <!-- 行：只渲染视口内的切片，上下用占位块撑住滚动高度 -->
           <div class="rows-wrap">
+            <div v-if="rowGapTop" class="rows-spacer" :style="{ height: `${rowGapTop}px` }">
+              <span class="spacer-side" :style="{ width: `${state.sideWidth}px` }" />
+            </div>
+
             <div
-              v-for="row in filteredRows"
+              v-for="row in visibleRows"
               :key="row.id"
               class="gantt-row"
               :class="{
@@ -387,13 +407,17 @@ function jumpToTask(task: GanttTask) {
 
               <div class="row-track" :style="{ width: `${timelineWidth}px` }">
                 <GanttBar
-                  v-for="task in tasksByRow.get(row.id) || []"
+                  v-for="task in visibleTasksByRow.get(row.id) || []"
                   :key="task.id"
                   :task="task"
                   @edit="openEdit"
                   @contextmenu="onBarContextMenu"
                 />
               </div>
+            </div>
+
+            <div v-if="rowGapBottom" class="rows-spacer" :style="{ height: `${rowGapBottom}px` }">
+              <span class="spacer-side" :style="{ width: `${state.sideWidth}px` }" />
             </div>
           </div>
 
@@ -648,6 +672,29 @@ function jumpToTask(task: GanttTask) {
 .rows-wrap {
   position: relative;
   z-index: 1;
+}
+
+/* 被裁掉的行用占位块顶住高度，同时把横向行线画出来保证网格连续 */
+.rows-spacer {
+  position: relative;
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent calc(var(--row-h) - 1px),
+    var(--line) calc(var(--row-h) - 1px),
+    var(--line) var(--row-h)
+  );
+}
+
+/* 占位的左栏：跟随横向滚动贴住左边，盖住行线 */
+.spacer-side {
+  position: sticky;
+  left: 0;
+  z-index: 3;
+  display: block;
+  height: 100%;
+  background: #fff;
+  border-right: 1px solid var(--line-strong);
 }
 
 .rows-filler {

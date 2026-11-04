@@ -11,11 +11,12 @@ const emit = defineEmits<{
   (e: 'contextmenu', task: GanttTask, event: MouseEvent): void
 }>()
 
-const { state, conflictIds, timeToX, beginDrag } = useGantt()
+const { state, rowConflicts, timeToX, beginDrag } = useGantt()
 
 const selected = computed(() => state.selectedId === props.task.id)
 const dragging = computed(() => state.draggingId === props.task.id)
-const conflict = computed(() => conflictIds.value.has(props.task.id))
+// 只订阅所在行的冲突分片：其他行的任务变动不会触发本块重渲染
+const conflict = computed(() => rowConflicts(props.task.rowId).has(props.task.id))
 
 const left = computed(() => timeToX(props.task.start))
 const width = computed(() => Math.max(6, timeToX(props.task.end) - timeToX(props.task.start)))
