@@ -498,7 +498,7 @@ function jumpToTask(task: GanttTask) {
 .gantt {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100%;
   min-height: 0;
   background: #fff;
 }
