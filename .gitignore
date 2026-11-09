@@ -10,3 +10,6 @@ dist-ssr
 
 # WorkBuddy 本地工作区数据
 .workbuddy/
+
+# 压测/截图产物
+shots/
