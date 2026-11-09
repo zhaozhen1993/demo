@@ -11,9 +11,15 @@ const emit = defineEmits<{
   (e: 'contextmenu', task: GanttTask, event: MouseEvent): void
 }>()
 
-const { state, rowConflicts, timeToX, beginDrag } = useGantt()
+const { state, rowConflicts, timeToX, beginDrag, selectedIdSet } = useGantt()
 
-const selected = computed(() => state.selectedId === props.task.id)
+const selected = computed(() => selectedIdSet.value.has(props.task.id))
+/** 多选状态下锚点块用更重的描边区分 */
+const primary = computed(
+  () => selected.value && state.selectedId === props.task.id && state.selectedIds.length > 1,
+)
+/** 多选中：隐藏左右拉伸手柄，避免误改时长 */
+const multi = computed(() => state.selectedIds.length > 1 && selected.value)
 const dragging = computed(() => state.draggingId === props.task.id)
 // 只订阅所在行的冲突分片：其他行的任务变动不会触发本块重渲染
 const conflict = computed(() => rowConflicts(props.task.rowId).has(props.task.id))
@@ -62,6 +68,8 @@ function onDrag(mode: 'move' | 'left' | 'right', event: MouseEvent) {
       `density-${density}`,
       {
         'is-selected': selected,
+        'is-primary': primary,
+        'is-multi': multi,
         'is-dragging': dragging,
         'is-conflict': conflict,
         'is-done': task.status === 'done',
@@ -83,7 +91,7 @@ function onDrag(mode: 'move' | 'left' | 'right', event: MouseEvent) {
 
     <span class="bar-handle bar-handle--right" @mousedown.stop="onDrag('right', $event)" />
 
-    <span v-if="dragging" class="bar-drag-tip">{{ rangeLabel }}</span>
+    <span v-if="dragging" class="bar-drag-tip">{{ state.dragTip || rangeLabel }}</span>
   </div>
 </template>
 
@@ -122,6 +130,22 @@ function onDrag(mode: 'move' | 'left' | 'right', event: MouseEvent) {
   outline-offset: 1px;
   box-shadow: 0 4px 14px rgba(15, 23, 42, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.25);
   z-index: 5;
+}
+
+/* 多选：非锚点块用虚线描边，锚点块保持实线，整组统一高亮 */
+.gantt-bar.is-selected.is-multi {
+  outline: 2px dashed #0f172a;
+  outline-offset: 1px;
+}
+
+.gantt-bar.is-selected.is-primary {
+  outline: 2px solid #0f172a;
+  outline-offset: 2px;
+}
+
+/* 多选时隐藏拉伸手柄，避免误改单个块的时长 */
+.gantt-bar.is-multi .bar-handle {
+  display: none;
 }
 
 .gantt-bar.is-dragging {

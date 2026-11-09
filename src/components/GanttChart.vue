@@ -26,8 +26,11 @@ const {
   timeToX,
   select,
   clearSelection,
-  nudge,
+  nudgeSelection,
+  moveSelectionRows,
+  deleteSelected,
   selectAdjacentRow,
+  selectionCount,
   deleteTask,
   updateTask,
   createTask,
@@ -187,7 +190,9 @@ const menu = ref<{ visible: boolean; x: number; y: number; task: GanttTask | nul
 })
 
 function onBarContextMenu(task: GanttTask, event: MouseEvent) {
-  select(task.id, false)
+  // 右键落在多选范围内时保留整组选择，只把这个块设为锚点
+  if (state.selectedIds.includes(task.id)) state.selectedId = task.id
+  else select(task.id, false)
   menu.value = { visible: true, x: event.clientX, y: event.clientY, task }
 }
 
@@ -202,8 +207,10 @@ function menuAction(action: 'edit' | 'duplicate' | 'delete') {
   if (action === 'edit') openEdit(task)
   if (action === 'duplicate') duplicateTask(task)
   if (action === 'delete') {
-    deleteTask(task.id)
-    ElMessage.success('任务已删除，可 Ctrl+Z 撤销')
+    const group = state.selectedIds.length > 1 && state.selectedIds.includes(task.id)
+    if (group) deleteSelected()
+    else deleteTask(task.id)
+    ElMessage.success(group ? '已删除所选任务，可 Ctrl+Z 撤销' : '任务已删除，可 Ctrl+Z 撤销')
   }
 }
 
@@ -234,20 +241,24 @@ function onKeydown(event: KeyboardEvent) {
     case 'ArrowLeft':
       event.preventDefault()
       if (!selectedTask.value) return
-      nudge(event.shiftKey ? -6 : -step, event.altKey ? 'end' : 'both')
+      // 多选时作用于整组；Alt 改时长只作用于锚点块
+      nudgeSelection(event.shiftKey ? -6 : -step, event.altKey ? 'end' : 'both')
       break
     case 'ArrowRight':
       event.preventDefault()
       if (!selectedTask.value) return
-      nudge(event.shiftKey ? 6 : step, event.altKey ? 'end' : 'both')
+      nudgeSelection(event.shiftKey ? 6 : step, event.altKey ? 'end' : 'both')
       break
     case 'ArrowUp':
       event.preventDefault()
-      selectAdjacentRow(-1)
+      // 多选时整体上移一行；单选时切换到上一行的任务
+      if (state.selectedIds.length > 1) moveSelectionRows(-1)
+      else selectAdjacentRow(-1)
       break
     case 'ArrowDown':
       event.preventDefault()
-      selectAdjacentRow(1)
+      if (state.selectedIds.length > 1) moveSelectionRows(1)
+      else selectAdjacentRow(1)
       break
     case 'Enter':
       if (selectedTask.value) {
@@ -259,7 +270,7 @@ function onKeydown(event: KeyboardEvent) {
     case 'Backspace':
       if (selectedTask.value) {
         event.preventDefault()
-        deleteTask(selectedTask.value.id)
+        deleteSelected()
       }
       break
     case 'Escape':
@@ -446,17 +457,22 @@ function jumpToTask(task: GanttTask) {
         </span>
       </div>
 
-      <div v-if="selectedTask" class="selection-info">
+      <div v-if="selectionCount > 1" class="selection-info">
+        <span class="sel-tag">已选中 {{ selectionCount }} 项</span>
+        <b>{{ selectedTask?.title }}</b>
+        <span class="sel-hint">拖动整组移动 · ↑↓ 整组换行 · Ctrl+点击增减 · Delete 批量删除</span>
+      </div>
+      <div v-else-if="selectedTask" class="selection-info">
         <span class="sel-tag">已选中</span>
         <b>{{ selectedTask.title }}</b>
         <span class="sel-time">
           {{ formatRange(selectedTask.start, selectedTask.end) }}
         </span>
-        <span class="sel-hint">← → 微调 · Alt+← → 改时长 · Enter 编辑</span>
+        <span class="sel-hint">← → 微调 · Alt+← → 改时长 · 上下拖动可换行 · Enter 编辑</span>
         <el-button text size="small" @click="jumpToTask(selectedTask)">定位</el-button>
       </div>
       <div v-else class="selection-info selection-info--empty">
-        点击甘特块或按 ↑ ↓ 选中任务，方向键可微调时间
+        点击甘特块或按 ↑ ↓ 选中任务，Ctrl+点击可多选，拖到其他行可换机位
       </div>
     </div>
 

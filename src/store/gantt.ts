@@ -1,10 +1,12 @@
 import { computed, reactive, shallowRef } from 'vue'
 import type { ComputedRef } from 'vue'
 import type {
+  DragMode,
   GanttRow,
   GanttTask,
   HistoryAction,
   HistoryEntry,
+  HistoryItem,
   TaskStatus,
   TaskType,
 } from '@/types/gantt'
@@ -16,6 +18,7 @@ import {
   addDays,
   formatDateTime,
   formatDuration,
+  formatHM,
   formatMD,
   formatRange,
   isWeekend,
@@ -47,15 +50,33 @@ export interface CommitPayload {
   mergeKey?: string
 }
 
-interface DragSession {
-  mode: 'move' | 'left' | 'right'
-  taskId: string
-  startX: number
+/** 拖拽中的单个任务快照 */
+interface DragItem {
+  id: string
   origStart: number
   origEnd: number
-  hourWidth: number
-  changed: boolean
+  origRowId: string
+  /** 在 filteredRows 中的下标，-1 表示所在行被过滤掉（只能改时间，不能换行） */
+  origRowIndex: number
 }
+
+interface DragSession {
+  mode: DragMode
+  /** 鼠标按下的那个块，作为整组的锚点 */
+  primaryId: string
+  /** 参与拖拽的块：多选拖动时是整个选中集合 */
+  items: DragItem[]
+  startX: number
+  startY: number
+  hourWidth: number
+  rowHeight: number
+  changed: boolean
+  /** 当前行偏移（拖动中实时更新） */
+  movedRows: number
+}
+
+/** 纵向拖动的死区：小于该像素不做换行判定，避免横向拖动时误换行 */
+const ROW_DRAG_DEAD_ZONE = 8
 
 function createGanttStore() {
   const now = Date.now()
@@ -64,10 +85,14 @@ function createGanttStore() {
     rows: MOCK_ROWS as GanttRow[],
     tasks: createMockTasks(now) as GanttTask[],
 
-    /** 当前选中的甘特块(键盘操作目标) */
+    /** 当前选中的甘特块(键盘操作目标/主选块) */
     selectedId: null as string | null,
-    /** 正在拖拽的块 */
+    /** 多选集合：Ctrl+点击累加，始终包含 selectedId（若其存在） */
+    selectedIds: [] as string[],
+    /** 正在拖拽的块（多选拖动时为锚点块） */
     draggingId: null as string | null,
+    /** 拖拽中的浮层提示文案 */
+    dragTip: '',
 
     /** 每小时像素宽 */
     hourWidth: 24,
@@ -225,6 +250,18 @@ function createGanttStore() {
     () => state.tasks.find((t) => t.id === state.selectedId) ?? null,
   )
 
+  /** 多选集合的 O(1) 查询版本，甘特块逐个判断是否选中时用 */
+  const selectedIdSet = computed(() => new Set(state.selectedIds))
+
+  /** 全部选中任务（保持 tasks 原始顺序） */
+  const selectedTasks = computed(() => {
+    if (!state.selectedIds.length) return [] as GanttTask[]
+    const set = selectedIdSet.value
+    return state.tasks.filter((t) => set.has(t.id))
+  })
+
+  const selectionCount = computed(() => state.selectedIds.length)
+
   const canUndo = computed(() => state.undoStack.length > 0)
   const canRedo = computed(() => state.redoStack.length > 0)
 
@@ -365,13 +402,19 @@ function createGanttStore() {
       map.set(row.id, hit)
     }
 
-    // 选中块与拖拽块必须保住 DOM：拖拽中被卸载会直接中断拖拽会话
-    for (const id of [state.draggingId, state.selectedId]) {
-      if (!id) continue
+    // 选中块与拖拽块必须保住 DOM：拖拽中被卸载会直接中断拖拽会话，
+    // 多选拖动时整组都要保留（含缓冲窗口之外的情况）
+    const keepIds = new Set<string>()
+    if (state.draggingId) keepIds.add(state.draggingId)
+    if (state.selectedId) keepIds.add(state.selectedId)
+    for (const id of state.selectedIds) keepIds.add(id)
+
+    for (const id of keepIds) {
       const task = state.tasks.find((t) => t.id === id)
       if (!task) continue
       const list = map.get(task.rowId)
-      if (list && !list.some((t) => t.id === id)) list.push(task)
+      if (!list) map.set(task.rowId, [task])
+      else if (!list.some((t) => t.id === id)) list.push(task)
     }
 
     return map
@@ -398,8 +441,10 @@ function createGanttStore() {
   /* 选中 / 滚动跟随                                                      */
   /* ------------------------------------------------------------------ */
 
+  /** 单选：重置为只选中该块 */
   function select(id: string | null, reveal = true) {
     state.selectedId = id
+    state.selectedIds = id ? [id] : []
     if (!id) return
     // 拖拽/点选时会 preventDefault，焦点不会自动回到画布，
     // 这里显式收回，保证方向键等快捷键立即可用
@@ -407,8 +452,43 @@ function createGanttStore() {
     if (reveal) revealTask(id)
   }
 
+  /** Ctrl+左键：把块加入/移出多选集合 */
+  function toggleSelect(id: string) {
+    const task = state.tasks.find((t) => t.id === id)
+    if (!task) return
+    if (state.selectedIds.includes(id)) {
+      const next = state.selectedIds.filter((x) => x !== id)
+      state.selectedIds = next
+      if (state.selectedId === id) state.selectedId = next[next.length - 1] ?? null
+    } else {
+      state.selectedIds = [...state.selectedIds, id]
+      state.selectedId = id
+    }
+    scrollEl.value?.focus({ preventScroll: true })
+  }
+
+  /** 只改变主选块（用于按在已选中的块上开始拖动），不收缩多选 */
+  function setPrimary(id: string) {
+    if (!state.selectedIds.includes(id)) {
+      select(id, false)
+      return
+    }
+    state.selectedId = id
+  }
+
+  /** 直接设定选中集合（撤销/重做后恢复选择用） */
+  function setSelection(ids: string[]) {
+    const alive = new Set(state.tasks.map((t) => t.id))
+    const next = ids.filter((id, i) => alive.has(id) && ids.indexOf(id) === i)
+    state.selectedIds = next
+    if (!state.selectedId || !next.includes(state.selectedId)) {
+      state.selectedId = next[next.length - 1] ?? null
+    }
+  }
+
   function clearSelection() {
     state.selectedId = null
+    state.selectedIds = []
   }
 
   function revealTask(id: string) {
@@ -517,6 +597,60 @@ function createGanttStore() {
     if (state.logs.length > 200) state.logs.length = 200
   }
 
+  /**
+   * 批量提交：一次拖动/整体移动/批量删除只记一条历史，
+   * undo 时逐条回滚，语义与单条操作一致。
+   */
+  function commitBatch(payload: {
+    action: HistoryAction
+    items: HistoryItem[]
+    detail: string
+    mergeKey?: string
+  }) {
+    if (!payload.items.length) return
+
+    const entry: HistoryEntry = {
+      id: uid('h'),
+      time: Date.now(),
+      action: payload.action,
+      taskId: payload.items[0].taskId,
+      taskLabel: `批量操作 · ${payload.items.length} 项`,
+      detail: payload.detail,
+      before: payload.items[0].before,
+      after: payload.items[0].after,
+      index: payload.items[0].index,
+      items: payload.items,
+      mergeKey: payload.mergeKey,
+      undone: false,
+    }
+
+    // 键盘连按整体微调：同一组任务在 900ms 内合并为一条
+    const last = state.undoStack[state.undoStack.length - 1]
+    if (
+      payload.mergeKey &&
+      last &&
+      last.mergeKey === payload.mergeKey &&
+      last.items &&
+      last.items.length === payload.items.length &&
+      !last.undone &&
+      Date.now() - last.time < 900
+    ) {
+      last.items = last.items.map((it, i) => ({
+        ...it,
+        after: payload.items[i].after,
+      }))
+      last.after = payload.items[0].after
+      last.time = entry.time
+      last.detail = payload.detail
+      return
+    }
+
+    state.undoStack.push(entry)
+    state.redoStack = []
+    state.logs.unshift(entry)
+    if (state.logs.length > 200) state.logs.length = 200
+  }
+
   function applySnapshot(taskId: string, snapshot: GanttTask | null, index: number) {
     const i = state.tasks.findIndex((t) => t.id === taskId)
     if (snapshot) {
@@ -528,22 +662,48 @@ function createGanttStore() {
     }
   }
 
+  /** 应用一条历史（批量记录逐条应用） */
+  function applyEntry(entry: HistoryEntry, side: 'before' | 'after') {
+    if (entry.items?.length) {
+      for (const item of entry.items) {
+        applySnapshot(item.taskId, side === 'before' ? item.before : item.after, item.index)
+      }
+      return
+    }
+    applySnapshot(entry.taskId, side === 'before' ? entry.before : entry.after, entry.index)
+  }
+
+  /** 撤销/重做后把选中状态同步到受影响的任务上 */
+  function syncSelection(entry: HistoryEntry) {
+    const ids = entry.items?.length
+      ? entry.items.map((i) => i.taskId)
+      : entry.before || entry.after
+        ? [entry.taskId]
+        : []
+    if (!ids.length) {
+      clearSelection()
+      return
+    }
+    state.selectedIds = ids
+    state.selectedId = ids[0]
+  }
+
   function undo() {
     const entry = state.undoStack.pop()
     if (!entry) return
-    applySnapshot(entry.taskId, entry.before, entry.index)
+    applyEntry(entry, 'before')
     entry.undone = true
     state.redoStack.push(entry)
-    state.selectedId = entry.before ? entry.taskId : null
+    syncSelection(entry)
   }
 
   function redo() {
     const entry = state.redoStack.pop()
     if (!entry) return
-    applySnapshot(entry.taskId, entry.after, entry.index)
+    applyEntry(entry, 'after')
     entry.undone = false
     state.undoStack.push(entry)
-    state.selectedId = entry.after ? entry.taskId : null
+    syncSelection(entry)
   }
 
   function clearHistory() {
@@ -608,27 +768,120 @@ function createGanttStore() {
       after: null,
       index,
     })
-    state.selectedId = null
+    state.selectedIds = state.selectedIds.filter((x) => x !== id)
+    if (state.selectedId === id) {
+      state.selectedId = state.selectedIds[state.selectedIds.length - 1] ?? null
+    }
+  }
+
+  /** 批量删除全部选中项（Delete 键在多选下的语义） */
+  function deleteSelected() {
+    const ids = [...state.selectedIds]
+    if (!ids.length) return
+    if (ids.length === 1) {
+      deleteTask(ids[0])
+      return
+    }
+    const idSet = new Set(ids)
+    const items: HistoryItem[] = []
+    state.tasks.forEach((task, index) => {
+      if (!idSet.has(task.id)) return
+      items.push({
+        taskId: task.id,
+        taskLabel: taskLabel(task),
+        before: { ...task },
+        after: null,
+        index,
+      })
+    })
+    if (!items.length) return
+    state.tasks = state.tasks.filter((t) => !idSet.has(t.id))
+    commitBatch({
+      action: 'delete',
+      items,
+      detail: `批量删除 ${items.length} 项，可 Ctrl+Z 撤销`,
+    })
+    clearSelection()
   }
 
   /* ------------------------------------------------------------------ */
-  /* 拖拽：整体平移 / 左右边缘拉伸                                         */
+  /* 拖拽：整体平移 / 左右边缘拉伸 / 纵向换行                              */
   /* ------------------------------------------------------------------ */
 
-  function beginDrag(event: MouseEvent, task: GanttTask, mode: DragSession['mode']) {
+  function rowIndexOf(rowId: string): number {
+    return filteredRows.value.findIndex((r) => r.id === rowId)
+  }
+
+  function buildDragItems(ids: string[]): DragItem[] {
+    const items: DragItem[] = []
+    for (const id of ids) {
+      const task = state.tasks.find((t) => t.id === id)
+      if (!task) continue
+      items.push({
+        id,
+        origStart: task.start,
+        origEnd: task.end,
+        origRowId: task.rowId,
+        origRowIndex: rowIndexOf(task.rowId),
+      })
+    }
+    return items
+  }
+
+  function buildDragTip(session: DragSession): string {
+    const primary = state.tasks.find((t) => t.id === session.primaryId)
+    if (!primary) return ''
+    const parts: string[] = []
+    if (session.items.length > 1) parts.push(`${session.items.length} 项`)
+    if (session.mode === 'move') {
+      parts.push(`${formatHM(primary.start)} - ${formatHM(primary.end)}`)
+      if (session.movedRows !== 0) {
+        const row = state.rows.find((r) => r.id === primary.rowId)
+        const dir = session.movedRows > 0 ? '下移' : '上移'
+        parts.push(`${dir} ${Math.abs(session.movedRows)} 行${row ? ` → ${row.tailNumber}` : ''}`)
+      }
+    } else {
+      parts.push(formatRange(primary.start, primary.end))
+    }
+    return parts.join(' · ')
+  }
+
+  /**
+   * @param mode move = 平移（可整组、可换行）；left/right = 拉伸锚点块
+   */
+  function beginDrag(event: MouseEvent, task: GanttTask, mode: DragMode) {
     if (event.button !== 0) return
+
+    // Ctrl/Cmd + 左键：切换多选，不进入拖拽
+    if (event.ctrlKey || event.metaKey) {
+      event.preventDefault()
+      toggleSelect(task.id)
+      return
+    }
+
+    const inSelection = state.selectedIds.includes(task.id)
+    if (inSelection) setPrimary(task.id)
+    else select(task.id, false)
+
     event.preventDefault()
-    select(task.id, false)
+
+    // 按在已选中的块上拖「块体」→ 整组一起移动；拉手柄只改锚点块
+    const dragIds =
+      mode === 'move' && state.selectedIds.length > 1 ? [...state.selectedIds] : [task.id]
+
     dragSession = {
       mode,
-      taskId: task.id,
+      primaryId: task.id,
+      items: buildDragItems(dragIds),
       startX: event.clientX,
-      origStart: task.start,
-      origEnd: task.end,
+      startY: event.clientY,
       hourWidth: state.hourWidth,
+      rowHeight: state.rowHeight,
       changed: false,
+      movedRows: 0,
     }
     state.draggingId = task.id
+    state.dragTip = ''
     window.addEventListener('mousemove', onDragMove)
     window.addEventListener('mouseup', onDragEnd)
     document.body.style.userSelect = 'none'
@@ -636,27 +889,67 @@ function createGanttStore() {
   }
 
   function onDragMove(event: MouseEvent) {
-    if (!dragSession) return
     const session = dragSession
-    const task = state.tasks.find((t) => t.id === session.taskId)
-    if (!task) return
+    if (!session) return
 
-    const deltaPx = event.clientX - session.startX
     const step = state.snapMinutes / 60
-    const snappedHours = Math.round(deltaPx / session.hourWidth / step) * step
-    const deltaMs = snappedHours * HOUR
-    const minMs = MIN_TASK_HOURS * HOUR
+    const deltaX = event.clientX - session.startX
+    const hours = Math.round(deltaX / session.hourWidth / step) * step
+    const deltaMs = hours * HOUR
 
+    // 纵向拖动 → 行偏移；只有整体平移才允许换行
+    let rowOffset = 0
     if (session.mode === 'move') {
-      task.start = session.origStart + deltaMs
-      task.end = session.origEnd + deltaMs
-    } else if (session.mode === 'left') {
-      task.start = Math.min(session.origStart + deltaMs, task.end - minMs)
-    } else {
-      task.end = Math.max(session.origEnd + deltaMs, task.start + minMs)
+      const dy = event.clientY - session.startY
+      if (Math.abs(dy) >= ROW_DRAG_DEAD_ZONE) {
+        rowOffset = Math.round(dy / session.rowHeight)
+        const rows = filteredRows.value
+        const valid = session.items.filter((i) => i.origRowIndex >= 0)
+        if (valid.length) {
+          const min = Math.min(...valid.map((i) => i.origRowIndex))
+          const max = Math.max(...valid.map((i) => i.origRowIndex))
+          // 不越出列表，也不越出当前渲染窗口（否则块会落到未渲染的行里"消失"）
+          const lower = Math.max(0, winStartRow.value) - min
+          const upper = Math.min(rows.length - 1, winEndRow.value - 1) - max
+          rowOffset = clamp(rowOffset, lower, Math.max(lower, upper))
+        }
+      }
     }
 
-    session.changed = task.start !== session.origStart || task.end !== session.origEnd
+    const rows = filteredRows.value
+    const minMs = MIN_TASK_HOURS * HOUR
+    let changed = false
+
+    for (const item of session.items) {
+      const task = state.tasks.find((t) => t.id === item.id)
+      if (!task) continue
+
+      if (session.mode === 'move') {
+        task.start = item.origStart + deltaMs
+        task.end = item.origEnd + deltaMs
+      } else if (session.mode === 'left') {
+        task.start = Math.min(item.origStart + deltaMs, task.end - minMs)
+      } else {
+        task.end = Math.max(item.origEnd + deltaMs, task.start + minMs)
+      }
+
+      if (rowOffset !== 0 && item.origRowIndex >= 0) {
+        const target = rows[item.origRowIndex + rowOffset]
+        if (target) task.rowId = target.id
+      }
+
+      if (
+        task.start !== item.origStart ||
+        task.end !== item.origEnd ||
+        task.rowId !== item.origRowId
+      ) {
+        changed = true
+      }
+    }
+
+    session.changed = changed
+    session.movedRows = rowOffset
+    state.dragTip = buildDragTip(session)
   }
 
   function onDragEnd() {
@@ -668,23 +961,67 @@ function createGanttStore() {
     const session = dragSession
     dragSession = null
     state.draggingId = null
-    if (!session || !session.changed) return
+    state.dragTip = ''
+    if (!session) return
 
-    const task = state.tasks.find((t) => t.id === session.taskId)
-    if (!task) return
+    // 只记录真正发生变化的块（多选时可能部分块被边界夹住没动）
+    const changedItems: HistoryItem[] = []
+    for (const item of session.items) {
+      const task = state.tasks.find((t) => t.id === item.id)
+      if (!task) continue
+      if (
+        task.start === item.origStart &&
+        task.end === item.origEnd &&
+        task.rowId === item.origRowId
+      ) {
+        continue
+      }
+      changedItems.push({
+        taskId: task.id,
+        taskLabel: taskLabel(task),
+        before: { ...task, start: item.origStart, end: item.origEnd, rowId: item.origRowId },
+        after: { ...task },
+        index: state.tasks.findIndex((t) => t.id === task.id),
+      })
+    }
+    if (!changedItems.length) return
 
-    const before: GanttTask = { ...task, start: session.origStart, end: session.origEnd }
     const action: HistoryAction =
       session.mode === 'move' ? 'move' : session.mode === 'left' ? 'resize-start' : 'resize-end'
 
-    commit({
-      action,
-      taskId: task.id,
-      taskLabel: taskLabel(task),
-      before,
-      after: { ...task },
-      index: state.tasks.findIndex((t) => t.id === task.id),
-    })
+    // 单块拖动保持原有历史语义（详情更具体）
+    if (changedItems.length === 1) {
+      const only = changedItems[0]
+      commit({
+        action,
+        taskId: only.taskId,
+        taskLabel: only.taskLabel,
+        before: only.before,
+        after: only.after,
+        index: only.index,
+      })
+      return
+    }
+
+    const primary =
+      changedItems.find((i) => i.taskId === session.primaryId) ?? changedItems[0]
+    const parts: string[] = [`共 ${changedItems.length} 项`]
+    if (primary.before && primary.after) {
+      const dStart = primary.after.start - primary.before.start
+      const dEnd = primary.after.end - primary.before.end
+      if (dStart === dEnd && dStart !== 0) {
+        parts.push(`整体${dStart > 0 ? '后移' : '前移'} ${formatDuration(Math.abs(dStart))}`)
+      } else {
+        if (dStart !== 0) parts.push(`开始${dStart > 0 ? '后移' : '前移'} ${formatDuration(Math.abs(dStart))}`)
+        if (dEnd !== 0) parts.push(`结束${dEnd > 0 ? '后移' : '前移'} ${formatDuration(Math.abs(dEnd))}`)
+      }
+    }
+    const rowMoved = changedItems.filter(
+      (i) => i.before && i.after && i.before.rowId !== i.after.rowId,
+    ).length
+    if (rowMoved) parts.push(`${rowMoved} 项换行`)
+
+    commitBatch({ action, items: changedItems, detail: parts.join(' · ') })
   }
 
   /* ------------------------------------------------------------------ */
@@ -721,6 +1058,80 @@ function createGanttStore() {
       mergeKey: `nudge:${task.id}:${edge}`,
     })
     revealTask(task.id)
+  }
+
+  /**
+   * 多选时的键盘微调：平移作用于整组；改时长(edge != both)仍只改主选块。
+   */
+  function nudgeSelection(hours: number, edge: 'both' | 'start' | 'end' = 'both') {
+    if (edge !== 'both' || state.selectedIds.length <= 1) {
+      nudge(hours, edge)
+      return
+    }
+    const tasks = selectedTasks.value
+    if (!tasks.length) return
+
+    const deltaMs = hours * HOUR
+    const items: HistoryItem[] = tasks.map((task) => {
+      const before: GanttTask = { ...task }
+      task.start += deltaMs
+      task.end += deltaMs
+      return {
+        taskId: task.id,
+        taskLabel: taskLabel(task),
+        before,
+        after: { ...task },
+        index: state.tasks.findIndex((t) => t.id === task.id),
+      }
+    })
+
+    commitBatch({
+      action: 'move',
+      items,
+      detail: `整体${hours > 0 ? '后移' : '前移'} ${formatDuration(Math.abs(deltaMs))} · 共 ${items.length} 项`,
+      mergeKey: `nudge-batch:${tasks.map((t) => t.id).join(',')}:${edge}`,
+    })
+    if (state.selectedId) revealTask(state.selectedId)
+  }
+
+  /** 多选时的 ↑ ↓：整组上下换行（单选时仍走 selectAdjacentRow 切换任务） */
+  function moveSelectionRows(dir: -1 | 1) {
+    const tasks = selectedTasks.value
+    if (!tasks.length) return
+    const rows = filteredRows.value
+    const entries = tasks
+      .map((task) => ({ task, index: rows.findIndex((r) => r.id === task.rowId) }))
+      .filter((e) => e.index >= 0)
+    if (!entries.length) return
+
+    const min = Math.min(...entries.map((e) => e.index))
+    const max = Math.max(...entries.map((e) => e.index))
+    if (dir < 0 && min === 0) return
+    if (dir > 0 && max >= rows.length - 1) return
+
+    const items: HistoryItem[] = []
+    for (const { task, index } of entries) {
+      const target = rows[index + dir]
+      if (!target) continue
+      const before: GanttTask = { ...task }
+      task.rowId = target.id
+      items.push({
+        taskId: task.id,
+        taskLabel: taskLabel(task),
+        before,
+        after: { ...task },
+        index: state.tasks.findIndex((t) => t.id === task.id),
+      })
+    }
+    if (!items.length) return
+
+    commitBatch({
+      action: 'move',
+      items,
+      detail: `整体${dir > 0 ? '下移' : '上移'} 1 行 · 共 ${items.length} 项`,
+      mergeKey: `row-batch:${dir}:${tasks.map((t) => t.id).join(',')}`,
+    })
+    if (state.selectedId) revealTask(state.selectedId)
   }
 
   /** 上下切换到相邻行的任务(优先同列最近的块) */
@@ -820,6 +1231,9 @@ function createGanttStore() {
     state.days = 7
     state.hourWidth = 24
     state.selectedId = null
+    state.selectedIds = []
+    state.draggingId = null
+    state.dragTip = ''
     state.keyword = ''
     state.typeFilter = []
     state.statusFilter = []
@@ -837,6 +1251,9 @@ function createGanttStore() {
     filteredRows,
     tasksByRow,
     selectedTask,
+    selectedIdSet,
+    selectedTasks,
+    selectionCount,
     canUndo,
     canRedo,
     stats,
@@ -864,6 +1281,9 @@ function createGanttStore() {
     conflictIds,
     // 选中
     select,
+    toggleSelect,
+    setPrimary,
+    setSelection,
     clearSelection,
     revealTask,
     // 历史
@@ -874,9 +1294,12 @@ function createGanttStore() {
     updateTask,
     createTask,
     deleteTask,
+    deleteSelected,
     // 交互
     beginDrag,
     nudge,
+    nudgeSelection,
+    moveSelectionRows,
     selectAdjacentRow,
     // 视图
     setRange,

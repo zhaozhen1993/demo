@@ -38,6 +38,15 @@ export type HistoryAction =
   | 'create'
   | 'delete'
 
+/** 批量操作中的单个任务快照 */
+export interface HistoryItem {
+  taskId: string
+  taskLabel: string
+  before: GanttTask | null
+  after: GanttTask | null
+  index: number
+}
+
 /** 一条历史记录 = 一次可回滚的操作 */
 export interface HistoryEntry {
   id: string
@@ -55,6 +64,8 @@ export interface HistoryEntry {
   after: GanttTask | null
   /** 任务在列表中的原始下标，用于删除后恢复层级 */
   index: number
+  /** 批量操作（多选拖动/整体移动/批量删除）时的逐条快照，存在时优先于 before/after */
+  items?: HistoryItem[]
   /** 连续同类操作的合并键(键盘微调时合并成一条) */
   mergeKey?: string
   /** 是否已被撤销 */
